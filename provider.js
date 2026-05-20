@@ -18,9 +18,9 @@ var HEADERS = {
 };
 
 // -------------------------------------------------------
-// IMDb ID -> dahili SID önbelleği (process boyunca)
+// IMDb ID -> dahili SID önbelleği
 // -------------------------------------------------------
-var imdbCache = {};  // { "tt1234567": "456" }
+var imdbCache = {};
 
 // -------------------------------------------------------
 // KATALOGLAR
@@ -55,7 +55,6 @@ var manifest = {
   logo: "https://sinewix.com/favicon.ico",
   resources: ["catalog", "meta", "stream"],
   types: ["movie", "series"],
-  // Hem sinewix hem tt (IMDb) prefix'lerini kabul et
   idPrefixes: ["sinewix", "tt"],
   catalogs: catalogDefs,
   behaviorHints: { adult: false, p2p: false }
@@ -77,10 +76,13 @@ function safe(url) {
   return url.replace(/^http:\/\//, "https://");
 }
 
+// IMDb ID'nin numeric kısmı: tt0120737 -> 120737, tt27444205 -> 27444205
+function imdbToNumeric(imdbId) {
+  return imdbId.replace(/^tt0*/, "") || "0";
+}
+
 function metaId(item) {
-  // IMDb ID varsa onu kullan — WuPlay tutarlı ID için bunu tercih eder
   if (item.imdb_id) return item.imdb_id;
-  // Yoksa dahili prefix
   var kind = item._kind || item.type;
   if (kind === "movie")  return "sinewixm" + item.id;
   if (kind === "anime")  return "sinewixa" + item.id;
@@ -88,25 +90,22 @@ function metaId(item) {
 }
 
 function videoId(imdbId, internalSid, s, e) {
-  // Video ID'si IMDb ID bazlı olursa WuPlay stream isteğinde aynı ID gelir
   if (imdbId) return imdbId + ":" + s + ":" + e;
   return "sinewixs" + internalSid + ":" + s + ":" + e;
 }
 
-// ID'yi parse et — hem tt hem sinewix formatını destekle
 function parseId(id) {
   // IMDb formatı: tt1234567  veya  tt1234567:2:5
   var mtt = /^(tt\d+)(?::(\d+):(\d+))?$/.exec(id);
   if (mtt) {
     return {
-      kind:    "imdb",   // IMDb ID — tip sonradan belirlenir
+      kind:    "imdb",
       imdbId:  mtt[1],
       season:  mtt[2] ? Number(mtt[2]) : undefined,
       episode: mtt[3] ? Number(mtt[3]) : undefined
     };
   }
-
-  // sinewix formatı: sinewixs123  veya  sinewixs123:2:5
+  // sinewix formatı
   var m = /^sinewix([sma])(\d+)(?::(\d+):(\d+))?$/.exec(id);
   if (!m) return null;
   return {
@@ -115,59 +114,6 @@ function parseId(id) {
     season:  m[3] ? Number(m[3]) : undefined,
     episode: m[4] ? Number(m[4]) : undefined
   };
-}
-
-// IMDb ID'ye karşılık gelen dahili SID'yi bul
-// Önce önbellekte ara, yoksa API'de ara
-function resolveSid(imdbId, type) {
-  if (imdbCache[imdbId]) {
-    console.log("[resolveSid] önbellekten:", imdbId, "->", imdbCache[imdbId]);
-    return Promise.resolve(imdbCache[imdbId]);
-  }
-
-  // IMDb ID'den tt kısmını at, sayıyı al
-  var numericId = imdbId.replace(/^tt0*/, "");
-
-  // 1. Önce doğrudan /media/detail ile dene (film için)
-  if (type === "movie") {
-    return apiGet("/media/detail/" + numericId + "/" + API_KEY)
-      .then(function(data) {
-        if (data && data.id) {
-          imdbCache[imdbId] = String(data.id);
-          return String(data.id);
-        }
-        throw new Error("film bulunamadı");
-      })
-      .catch(function() {
-        return searchBySid(imdbId, numericId);
-      });
-  }
-
-  // 2. Dizi için /series/show ile dene
-  return apiGet("/series/show/" + numericId + "/" + API_KEY)
-    .then(function(data) {
-      if (data && data.id) {
-        imdbCache[imdbId] = String(data.id);
-        return String(data.id);
-      }
-      throw new Error("dizi bulunamadı");
-    })
-    .catch(function() {
-      return searchBySid(imdbId, numericId);
-    });
-}
-
-// Arama endpoint'iyle SID bul (fallback)
-function searchBySid(imdbId, numericId) {
-  return apiGet("/search/" + encodeURIComponent(imdbId) + "/" + API_KEY)
-    .then(function(data) {
-      var results = data.search || [];
-      if (!results.length) throw new Error("arama sonucu yok: " + imdbId);
-      var sid = String(results[0].id);
-      imdbCache[imdbId] = sid;
-      console.log("[resolveSid] arama ile bulundu:", imdbId, "->", sid);
-      return sid;
-    });
 }
 
 function releaseInfo(a, b) {
@@ -186,8 +132,8 @@ function toGenres(v) {
 
 function toMeta(item, forceKind) {
   var kind = forceKind || item.type;
-  var stremioType = kind === "movie" ? "movie" : "series";
   item._kind = kind;
+  var stremioType = kind === "movie" ? "movie" : "series";
   return {
     id:          metaId(item),
     type:        stremioType,
@@ -215,9 +161,59 @@ function toStreams(videos, label) {
         }
       };
     });
-
-  console.log("[toStreams] toplam video:", (videos || []).length, "| link var:", streams.length);
+  console.log("[toStreams] ham video sayısı:", (videos || []).length, "| geçerli link:", streams.length);
   return streams;
+}
+
+// -------------------------------------------------------
+// IMDb ID -> SID çözümleyici
+// Strateji: IMDb'nin numeric kısmını doğrudan API'ye gönder.
+// API kendi ID'si olarak IMDb numeric ID'yi kullanıyor olabilir.
+// Yoksa meta önbelleğinden bul, o da yoksa başarısız ol.
+// -------------------------------------------------------
+function resolveSid(imdbId, apiType) {
+  if (imdbCache[imdbId]) {
+    console.log("[resolveSid] önbellek:", imdbId, "->", imdbCache[imdbId]);
+    return Promise.resolve(imdbCache[imdbId]);
+  }
+
+  var numeric = imdbToNumeric(imdbId);
+  console.log("[resolveSid] deneniyor — imdbId:", imdbId, "numeric:", numeric, "type:", apiType);
+
+  // Strateji 1: numeric ID'yi doğrudan API endpoint'ine gönder
+  var endpoint = apiType === "movie"
+    ? "/media/detail/" + numeric + "/" + API_KEY
+    : "/series/show/"  + numeric + "/" + API_KEY;
+
+  return apiGet(endpoint)
+    .then(function(data) {
+      if (data && data.id) {
+        var sid = String(data.id);
+        imdbCache[imdbId] = sid;
+        console.log("[resolveSid] doğrudan bulundu:", imdbId, "->", sid, "(API id:", data.id, ")");
+        return sid;
+      }
+      throw new Error("API id alanı yok");
+    })
+    .catch(function(err) {
+      console.log("[resolveSid] doğrudan başarısız:", err.message, "— ters deneme...");
+
+      // Strateji 2: Film için /series/show dene, dizi için /media/detail dene
+      var altEndpoint = apiType === "movie"
+        ? "/series/show/"  + numeric + "/" + API_KEY
+        : "/media/detail/" + numeric + "/" + API_KEY;
+
+      return apiGet(altEndpoint)
+        .then(function(data) {
+          if (data && data.id) {
+            var sid = String(data.id);
+            imdbCache[imdbId] = sid;
+            console.log("[resolveSid] ters endpoint ile bulundu:", imdbId, "->", sid);
+            return sid;
+          }
+          throw new Error("ters endpoint de boş");
+        });
+    });
 }
 
 // -------------------------------------------------------
@@ -256,7 +252,6 @@ function getCatalog(type, id, extra) {
   return apiGet(cat.path + "?page=" + page)
     .then(function(data) {
       var items = data.data || [];
-
       if (cat.source === "episodes") {
         var seen = {};
         items = items.filter(function(item) {
@@ -265,12 +260,7 @@ function getCatalog(type, id, extra) {
           return true;
         });
       }
-
-      var metas = items.map(function(item) {
-        return toMeta(item, cat.itemType || undefined);
-      });
-
-      return { metas: metas };
+      return { metas: items.map(function(item) { return toMeta(item, cat.itemType || undefined); }) };
     })
     .catch(function(err) {
       console.error("[catalog/" + id + "]", err.message);
@@ -285,21 +275,15 @@ function getMeta(type, id) {
   var p = parseId(id);
   if (!p) return Promise.resolve({ meta: null });
 
-  // IMDb ID ile gelen meta isteği
+  var apiType = type === "movie" ? "movie" : "series";
+
   if (p.kind === "imdb") {
-    var apiType = type === "movie" ? "movie" : "series";
     return resolveSid(p.imdbId, apiType)
       .then(function(sid) {
         if (apiType === "movie") {
-          return apiGet("/media/detail/" + sid + "/" + API_KEY)
-            .then(function(data) {
-              return buildMovieMeta(id, data);
-            });
+          return apiGet("/media/detail/" + sid + "/" + API_KEY).then(function(d) { return buildMovieMeta(id, d); });
         }
-        return apiGet("/series/show/" + sid + "/" + API_KEY)
-          .then(function(data) {
-            return buildSeriesMeta(id, p.imdbId, sid, data);
-          });
+        return apiGet("/series/show/" + sid + "/" + API_KEY).then(function(d) { return buildSeriesMeta(id, p.imdbId, sid, d); });
       })
       .catch(function(err) {
         console.error("[meta/imdb/" + id + "]", err.message);
@@ -307,23 +291,15 @@ function getMeta(type, id) {
       });
   }
 
-  // Film (sinewix prefix)
   if (p.kind === "movie") {
     return apiGet("/media/detail/" + p.sid + "/" + API_KEY)
-      .then(function(data) { return buildMovieMeta(id, data); })
-      .catch(function(err) {
-        console.error("[meta/movie/" + id + "]", err.message);
-        return { meta: null };
-      });
+      .then(function(d) { return buildMovieMeta(id, d); })
+      .catch(function(err) { console.error("[meta/movie]", err.message); return { meta: null }; });
   }
 
-  // Dizi / Anime (sinewix prefix)
   return apiGet("/series/show/" + p.sid + "/" + API_KEY)
-    .then(function(data) { return buildSeriesMeta(id, null, p.sid, data); })
-    .catch(function(err) {
-      console.error("[meta/series/" + id + "]", err.message);
-      return { meta: null };
-    });
+    .then(function(d) { return buildSeriesMeta(id, null, p.sid, d); })
+    .catch(function(err) { console.error("[meta/series]", err.message); return { meta: null }; });
 }
 
 function buildMovieMeta(id, data) {
@@ -353,7 +329,6 @@ function buildSeriesMeta(id, imdbId, sid, data) {
     (season.episodes || []).forEach(function(ep) {
       var eNum = Number(ep.episode_number);
       videos.push({
-        // IMDb ID varsa video ID'si tt formatında — WuPlay stream isteğiyle eşleşir
         id:        videoId(imdbId, sid, sNum, eNum),
         title:     ep.name || (eNum + ". Bölüm"),
         season:    sNum,
@@ -396,40 +371,34 @@ function getStreams(type, id) {
     return Promise.resolve({ streams: [] });
   }
 
-  console.log("[stream] istek — kind:", p.kind, "imdbId:", p.imdbId, "season:", p.season, "episode:", p.episode);
+  console.log("[stream] istek — kind:", p.kind, "| id:", id);
 
-  // IMDb ID ile gelen stream isteği (WuPlay'in gönderdiği format)
+  var apiType = type === "movie" ? "movie" : "series";
+
+  // IMDb ID ile gelen istek
   if (p.kind === "imdb") {
-    var apiType = type === "movie" ? "movie" : "series";
     return resolveSid(p.imdbId, apiType)
       .then(function(sid) {
         if (apiType === "movie") {
-          return apiGet("/media/detail/" + sid + "/" + API_KEY)
-            .then(function(data) {
-              console.log("[stream/imdb/movie] ham videos:", JSON.stringify(data.videos || []));
-              return { streams: toStreams(data.videos, "movie") };
-            });
+          return apiGet("/media/detail/" + sid + "/" + API_KEY).then(function(data) {
+            console.log("[stream/imdb/movie] videos:", JSON.stringify(data.videos || []));
+            return { streams: toStreams(data.videos, "movie") };
+          });
         }
 
         if (p.season === undefined || p.episode === undefined) {
+          console.error("[stream/imdb/series] sezon/bölüm eksik");
           return { streams: [] };
         }
 
-        return apiGet("/series/show/" + sid + "/" + API_KEY)
-          .then(function(data) {
-            var season = (data.seasons || []).find(function(s) {
-              return Number(s.season_number) === p.season;
-            });
-            if (!season) { console.error("[stream/imdb/series] sezon yok:", p.season); return { streams: [] }; }
-
-            var ep = (season.episodes || []).find(function(e) {
-              return Number(e.episode_number) === p.episode;
-            });
-            if (!ep) { console.error("[stream/imdb/series] bölüm yok:", p.episode); return { streams: [] }; }
-
-            console.log("[stream/imdb/series] ham ep.videos:", JSON.stringify(ep.videos || []));
-            return { streams: toStreams(ep.videos, "s" + p.season + "e" + p.episode) };
-          });
+        return apiGet("/series/show/" + sid + "/" + API_KEY).then(function(data) {
+          var season = (data.seasons || []).find(function(s) { return Number(s.season_number) === p.season; });
+          if (!season) { console.error("[stream] sezon yok:", p.season); return { streams: [] }; }
+          var ep = (season.episodes || []).find(function(e) { return Number(e.episode_number) === p.episode; });
+          if (!ep) { console.error("[stream] bölüm yok:", p.episode); return { streams: [] }; }
+          console.log("[stream/imdb/series] ep.videos:", JSON.stringify(ep.videos || []));
+          return { streams: toStreams(ep.videos, "s" + p.season + "e" + p.episode) };
+        });
       })
       .catch(function(err) {
         console.error("[stream/imdb/" + id + "]", err.message);
@@ -437,42 +406,28 @@ function getStreams(type, id) {
       });
   }
 
-  // sinewix prefix'li stream (eski format — geriye dönük uyumluluk)
+  // sinewix prefix'li istek
   if (p.kind === "movie") {
     return apiGet("/media/detail/" + p.sid + "/" + API_KEY)
       .then(function(data) {
-        console.log("[stream/movie] ham videos:", JSON.stringify(data.videos || []));
+        console.log("[stream/movie] videos:", JSON.stringify(data.videos || []));
         return { streams: toStreams(data.videos, "movie") };
       })
-      .catch(function(err) {
-        console.error("[stream/movie/" + id + "]", err.message);
-        return { streams: [] };
-      });
+      .catch(function(err) { console.error("[stream/movie]", err.message); return { streams: [] }; });
   }
 
-  if (p.season === undefined || p.episode === undefined) {
-    return Promise.resolve({ streams: [] });
-  }
+  if (p.season === undefined || p.episode === undefined) return Promise.resolve({ streams: [] });
 
   return apiGet("/series/show/" + p.sid + "/" + API_KEY)
     .then(function(data) {
-      var season = (data.seasons || []).find(function(s) {
-        return Number(s.season_number) === p.season;
-      });
+      var season = (data.seasons || []).find(function(s) { return Number(s.season_number) === p.season; });
       if (!season) return { streams: [] };
-
-      var ep = (season.episodes || []).find(function(e) {
-        return Number(e.episode_number) === p.episode;
-      });
+      var ep = (season.episodes || []).find(function(e) { return Number(e.episode_number) === p.episode; });
       if (!ep) return { streams: [] };
-
-      console.log("[stream/series] ham ep.videos:", JSON.stringify(ep.videos || []));
+      console.log("[stream/series] ep.videos:", JSON.stringify(ep.videos || []));
       return { streams: toStreams(ep.videos, "s" + p.season + "e" + p.episode) };
     })
-    .catch(function(err) {
-      console.error("[stream/series/" + id + "]", err.message);
-      return { streams: [] };
-    });
+    .catch(function(err) { console.error("[stream/series]", err.message); return { streams: [] }; });
 }
 
 // -------------------------------------------------------
