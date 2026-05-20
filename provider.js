@@ -122,17 +122,25 @@ function toMeta(item, forceKind) {
   };
 }
 
-function toStreams(videos) {
-  return (videos || [])
-    .filter(function(v) { return v.status === 1 && v.link; })
+// FİX 1: status filtresi kaldırıldı, sadece link varlığı kontrol ediliyor
+// FİX 2: WuPlay için gerekli bingeGroup eklendi
+function toStreams(videos, label) {
+  var streams = (videos || [])
+    .filter(function(v) { return v.link; })
     .map(function(v) {
       return {
         url:   safe(v.link),
         name:  "SineWix",
-        title: v.lang || "TR",
-        behaviorHints: { notWebReady: false }
+        title: v.lang || v.name || "TR",
+        behaviorHints: {
+          bingeGroup: "sinewix-addon-" + (label || "default"),
+          notWebReady: false
+        }
       };
     });
+
+  console.log("[toStreams] toplam video:", (videos || []).length, "| link var:", streams.length);
+  return streams;
 }
 
 // -------------------------------------------------------
@@ -240,12 +248,12 @@ function getMeta(type, id) {
         (season.episodes || []).forEach(function(ep) {
           var eNum = Number(ep.episode_number);
           videos.push({
-            id:       videoId(p.sid, sNum, eNum),
-            title:    ep.name || (eNum + ". Bölüm"),
-            season:   sNum,
-            episode:  eNum,
-            overview: ep.overview || "",
-            released: ep.air_date ? ep.air_date + "T00:00:00.000Z" : undefined,
+            id:        videoId(p.sid, sNum, eNum),
+            title:     ep.name || (eNum + ". Bölüm"),
+            season:    sNum,
+            episode:   eNum,
+            overview:  ep.overview || "",
+            released:  ep.air_date ? ep.air_date + "T00:00:00.000Z" : undefined,
             thumbnail: safe(ep.still_path)
           });
         });
@@ -282,13 +290,19 @@ function getMeta(type, id) {
 // -------------------------------------------------------
 function getStreams(type, id) {
   var p = parseId(id);
-  if (!p) return Promise.resolve({ streams: [] });
+  if (!p) {
+    console.error("[stream] parse edilemeyen ID:", id);
+    return Promise.resolve({ streams: [] });
+  }
+
+  console.log("[stream] istek — kind:", p.kind, "sid:", p.sid, "season:", p.season, "episode:", p.episode);
 
   // Film
   if (p.kind === "movie") {
     return apiGet("/media/detail/" + p.sid + "/" + API_KEY)
       .then(function(data) {
-        return { streams: toStreams(data.videos) };
+        console.log("[stream/movie] ham videos:", JSON.stringify(data.videos || []));
+        return { streams: toStreams(data.videos, "movie") };
       })
       .catch(function(err) {
         console.error("[stream/movie/" + id + "]", err.message);
@@ -296,27 +310,35 @@ function getStreams(type, id) {
       });
   }
 
-  // Anime — stream yok
-  if (p.kind === "anime") return Promise.resolve({ streams: [] });
-
-  // Dizi
+  // Dizi veya Anime — sezon/bölüm bilgisi zorunlu
   if (p.season === undefined || p.episode === undefined) {
+    console.error("[stream] sezon/bölüm bilgisi eksik:", id);
     return Promise.resolve({ streams: [] });
   }
 
+  // FİX 3: Anime artık dizi gibi stream alıyor (tamamen bloklanmıyor)
   return apiGet("/series/show/" + p.sid + "/" + API_KEY)
     .then(function(data) {
+      console.log("[stream/series] sezon sayısı:", (data.seasons || []).length);
+
       var season = (data.seasons || []).find(function(s) {
         return Number(s.season_number) === p.season;
       });
-      if (!season) return { streams: [] };
+      if (!season) {
+        console.error("[stream/series] sezon bulunamadı:", p.season);
+        return { streams: [] };
+      }
 
       var ep = (season.episodes || []).find(function(e) {
         return Number(e.episode_number) === p.episode;
       });
-      if (!ep) return { streams: [] };
+      if (!ep) {
+        console.error("[stream/series] bölüm bulunamadı:", p.episode);
+        return { streams: [] };
+      }
 
-      return { streams: toStreams(ep.videos) };
+      console.log("[stream/series] ham ep.videos:", JSON.stringify(ep.videos || []));
+      return { streams: toStreams(ep.videos, "series-s" + p.season + "e" + p.episode) };
     })
     .catch(function(err) {
       console.error("[stream/series/" + id + "]", err.message);
